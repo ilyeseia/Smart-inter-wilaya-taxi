@@ -1,0 +1,277 @@
+name: Deploy Smart Inter Wilaya Taxi
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: smart_taxi_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        
+    - name: Cache Maven dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+        
+    - name: Set application.properties for tests
+      run: |
+        cd user-service
+        cp src/main/resources/application.properties src/main/resources/application-test.properties
+        
+    - name: Build with Maven
+      run: |
+        cd user-service
+        mvn clean package -DskipTests
+        
+    - name: Run tests
+      run: |
+        cd user-service
+        mvn test
+      env:
+        DATABASE_URL: jdbc:postgresql://localhost:5432/smart_taxi_db
+        DATABASE_USERNAME: postgres
+        DATABASE_PASSWORD: postgres
+
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./user-service/Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Create Deployment Summary
+      run: |
+        echo "🚀 Smart Inter Wilaya Taxi User Service deployed successfully!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Deployed Service**: User Service" >> $GITHUB_STEP_SUMMARY
+        echo "**Image**: ${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Environment**: Production" >> $GITHUB_STEP_SUMMARY
+        echo "**Database**: PostgreSQL 15" >> $GITHUB_STEP_SUMMARY
+        echo "**Cache**: Redis 7" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### API Endpoints:" >> $GITHUB_STEP_SUMMARY
+        echo "- Health Check: \`GET /user-service/api/health\`" >> $GITHUB_STEP_SUMMARY
+        echo "- User Registration: \`POST /user-service/api/auth/register\`" >> $GITHUB_STEP_SUMMARY
+        echo "- User Login: \`POST /user-service/api/auth/login\`" >> $GITHUB_STEP_SUMMARY
+        echo "- User Profile: \`GET /user-service/api/users/{id}\`" >> $GITHUB_STEP_SUMMARY
+
+  deploy-compose:
+    needs: build-and-deploy
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Create docker-compose.prod.yml
+      run: |
+        cat > docker-compose.prod.yml << 'EOF'
+        version: '3.8'
+        
+        services:
+          postgres:
+            image: postgres:15-alpine
+            container_name: smart-taxi-postgres-prod
+            environment:
+              POSTGRES_DB: smart_taxi_db
+              POSTGRES_USER: postgres
+              POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+            ports:
+              - "5432:5432"
+            volumes:
+              - postgres_data:/var/lib/postgresql/data
+              - ./database/setup.sql:/docker-entrypoint-initdb.d/setup.sql
+            healthcheck:
+              test: ["CMD-SHELL", "pg_isready -U postgres -d smart_taxi_db"]
+              interval: 10s
+              timeout: 5s
+              retries: 5
+            restart: unless-stopped
+            
+          redis:
+            image: redis:7-alpine
+            container_name: smart-taxi-redis-prod
+            ports:
+              - "6379:6379"
+            command: redis-server --appendonly yes
+            volumes:
+              - redis_data:/data
+            healthcheck:
+              test: ["CMD", "redis-cli", "ping"]
+              interval: 10s
+              timeout: 3s
+              retries: 5
+            restart: unless-stopped
+            
+          user-service:
+            image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            container_name: smart-taxi-user-service-prod
+            environment:
+              SPRING_PROFILES_ACTIVE: docker
+              DATABASE_URL: jdbc:postgresql://postgres:5432/smart_taxi_db
+              DATABASE_USERNAME: postgres
+              DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+              REDIS_HOST: redis
+              REDIS_PORT: 6379
+            ports:
+              - "8081:8081"
+            depends_on:
+              postgres:
+                condition: service_healthy
+              redis:
+                condition: service_healthy
+            healthcheck:
+              test: ["CMD-SHELL", "curl -f http://localhost:8081/user-service/api/health || exit 1"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+              start_period: 60s
+            restart: unless-stopped
+            volumes:
+              - ./logs:/app/logs
+              
+        volumes:
+          postgres_data:
+          redis_data:
+        EOF
+        
+    - name: Deploy with Docker Compose
+      run: |
+        docker-compose -f docker-compose.prod.yml up -d
+        
+    - name: Wait for services to be healthy
+      run: |
+        echo "Waiting for services to start..."
+        sleep 30
+        
+        echo "Checking PostgreSQL..."
+        docker-compose -f docker-compose.prod.yml exec -T postgres pg_isready -U postgres -d smart_taxi_db
+        
+        echo "Checking Redis..."
+        docker-compose -f docker-compose.prod.yml exec -T redis redis-cli ping
+        
+        echo "Checking User Service..."
+        sleep 10
+        curl -f http://localhost:8081/user-service/api/health || exit 1
+        
+    - name: Test API endpoints
+      run: |
+        echo "Testing user registration..."
+        curl -X POST http://localhost:8081/user-service/api/auth/register \
+          -H "Content-Type: application/json" \
+          -d '{
+            "email": "test@example.com",
+            "password": "TestPassword123!",
+            "firstName": "Test",
+            "lastName": "User",
+            "phoneNumber": "+1234567890",
+            "city": "Test City",
+            "wilaya": "Test Wilaya",
+            "licenseNumber": "TEST123"
+          }'
+          
+        echo ""
+        echo "Testing user login..."
+        curl -X POST http://localhost:8081/user-service/api/auth/login \
+          -H "Content-Type: application/json" \
+          -d '{
+            "email": "test@example.com",
+            "password": "TestPassword123!"
+          }'
+
+    - name: Show deployment status
+      run: |
+        echo "✅ Deployment completed successfully!"
+        echo ""
+        echo "Services running:"
+        docker-compose -f docker-compose.prod.yml ps
+        echo ""
+        echo "Service logs:"
+        docker-compose -f docker-compose.prod.yml logs user-service --tail=20
